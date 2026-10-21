@@ -56,27 +56,39 @@ jobs:
       run: |
         cd workspace
         
-        # Клонируем дерево устройств напрямую по вашему пути
-        git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ${{ github.event.inputs.DEVICE_PATH }}
+        # Клонируем дерево устройств во временную папку open_tree
+        git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         
-        # Выводим содержимое папки в лог для верификации
-        echo "=== Содержимое папки устройства ==="
-        ls -la ${{ github.event.inputs.DEVICE_PATH }}
+        # Если внутри репозитория уже есть структура папок "device/", объединяем её с корнем workspace
+        if [ -d "open_tree/device" ]; then
+            echo "Обнаружена вложенная структура папок. Переносим файлы..."
+            cp -r open_tree/device/* device/ 2>/dev/null || true
+            rm -rf open_tree
+        else
+            echo "Обнаружена плоская структура. Переносим в целевой путь..."
+            mkdir -p ${{ github.event.inputs.DEVICE_PATH }}
+            mv open_tree/* ${{ github.event.inputs.DEVICE_PATH }}/ 2>/dev/null || true
+            rm -rf open_tree
+        fi
         
         # Если найден файл omni_, автоматически адаптируем его под требования Android 14/15
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
-            echo "Обнаружена конфигурация omni_. Адаптируем под правила twrp-14.1..."
+            echo "Адаптируем конфигурацию omni под правила twrp-14.1..."
             mv "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk"
             sed -i "s/omni_${{ github.event.inputs.DEVICE_NAME }}/twrp_${{ github.event.inputs.DEVICE_NAME }}/g" "${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk"
         fi
 
-        # Проверяем итоговое наличие мейкфайла
+        # Финальная проверка мейкфайла по правильному итоговому пути
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=twrp_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "Конфигурация успешно подготовлена!"
+            echo "Конфигурация устройства успешно подготовлена!"
         else
-            echo "::error::Файл конфигурации .mk не найден в папке устройства!" && exit 1
+            echo "::error::Критическая ошибка: Файл twrp_${{ github.event.inputs.DEVICE_NAME }}.mk не найден!"
+            echo "Текущая структура папок для отладки:"
+            ls -R device/
+            exit 1
         fi
+
 
     - name: Building Image 
       run: |
