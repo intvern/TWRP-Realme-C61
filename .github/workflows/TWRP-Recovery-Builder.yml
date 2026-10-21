@@ -56,10 +56,10 @@ jobs:
       run: |
         cd workspace
         
-        # Клонируем дерево устройств во временную папку open_tree
+        # Клонируем дерево устройств во временную папку
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         
-        # Если внутри репозитория уже есть структура папок "device/", объединяем её с корнем workspace
+        # Переносим файлы и автоматически устраняем двойную вложенность папок
         if [ -d "open_tree/device" ]; then
             echo "Обнаружена вложенная структура папок. Переносим файлы..."
             cp -r open_tree/device/* device/ 2>/dev/null || true
@@ -71,24 +71,21 @@ jobs:
             rm -rf open_tree
         fi
         
-        # Если найден файл omni_, автоматически адаптируем его под требования Android 14/15
+        # КРИТИЧЕСКИЙ ФИКС ДЛЯ ANDROID 14/15:
+        # Удаляем vendorsetup.sh, так как add_lunch_combo вызывает фатальный сбой парсинга в AOSP 14
+        rm -f "${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh"
+        echo "Старый файл vendorsetup.sh успешно удален."
+
+        # Проверяем наличие оригинального мейкфайла от SebaUbuntu
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
-            echo "Адаптируем конфигурацию omni под правила twrp-14.1..."
-            mv "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk"
-            sed -i "s/omni_${{ github.event.inputs.DEVICE_NAME }}/twrp_${{ github.event.inputs.DEVICE_NAME }}/g" "${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk"
-        fi
-
-        # Финальная проверка мейкфайла по правильному итоговому пути
-        if [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
+            echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
+            echo "Конфигурация omni_${{ github.event.inputs.DEVICE_NAME }} успешно подготовлена!"
+        elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=twrp_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "Конфигурация устройства успешно подготовлена!"
+            echo "Конфигурация twrp_${{ github.event.inputs.DEVICE_NAME }} успешно подготовлена!"
         else
-            echo "::error::Критическая ошибка: Файл twrp_${{ github.event.inputs.DEVICE_NAME }}.mk не найден!"
-            echo "Текущая структура папок для отладки:"
-            ls -R device/
-            exit 1
+            echo "::error::Критическая ошибка: Файл конфигурации .mk не найден в папке устройства!" && exit 1
         fi
-
 
     - name: Building Image 
       run: |
@@ -96,9 +93,11 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
+        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
+        # Теперь lunch отработает идеально, так как профиль omni_ussi_arm64 прописан в COMMON_LUNCH_CHOICES
         lunch ${{ env.DEVICE_MAKEFILE }}-userdebug && make clean && make $MAKE_TARGET -j$(nproc --all)
 
     - name: Verify & Upload Release
