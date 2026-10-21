@@ -42,8 +42,7 @@ jobs:
     - name: Prepare Environment
       run: |
         sudo apt update && sudo apt -y upgrade
-        sudo apt -y install gperf gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib lib32ncurses5-dev x11proto-core-dev lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc bc ccache lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libwxgtk3.0-gtk3-dev lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp qemu-user-static libstdc++-10-dev libtinfo5 libgflags-dev
-        sudo add-apt-repository -y universe && sudo apt -y install libncurses5
+        sudo apt -y install gperf gcc-multilib g++-multilib libxml2-utils xsltproc bc ccache liblz4-tool libncurses5-dev lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp qemu-user-static libgflags-dev python3
         mkdir ~/bin && curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo && chmod a+x ~/bin/repo && sudo ln -sf ~/bin/repo /usr/bin/repo
 
     - name: Initialize & Sync Repo
@@ -56,14 +55,27 @@ jobs:
     - name: Clone Device Tree & Check Makefile
       run: |
         cd workspace
+        
+        # Клонируем дерево устройств напрямую по вашему пути
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ${{ github.event.inputs.DEVICE_PATH }}
         
+        # Выводим содержимое папки в лог для верификации
+        echo "=== Содержимое папки устройства ==="
+        ls -la ${{ github.event.inputs.DEVICE_PATH }}
+        
+        # Если найден файл omni_, автоматически адаптируем его под требования Android 14/15
+        if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
+            echo "Обнаружена конфигурация omni_. Адаптируем под правила twrp-14.1..."
+            mv "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk"
+            sed -i "s/omni_${{ github.event.inputs.DEVICE_NAME }}/twrp_${{ github.event.inputs.DEVICE_NAME }}/g" "${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk"
+        fi
+
+        # Проверяем итоговое наличие мейкфайла
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=twrp_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-        elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
-            echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
+            echo "Конфигурация успешно подготовлена!"
         else
-            echo "::error::No recovery makefile found!" && exit 1
+            echo "::error::Файл конфигурации .mk не найден в папке устройства!" && exit 1
         fi
 
     - name: Building Image 
