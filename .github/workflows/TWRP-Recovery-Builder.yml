@@ -87,24 +87,19 @@ jobs:
 
     - name: Building Image 
       run: |
-        # Умный поиск пути к envsetup.sh по всему репозиторию Actions
-        ENVSETUP_PATH=$(find $GITHUB_WORKSPACE -type f -name "envsetup.sh" | head -n 1)
+        # Жестко переходим в корневую папку workspace, где лежит папка device
+        cd $GITHUB_WORKSPACE/workspace
+        echo "Текущая рабочая директория: $(pwd)"
         
-        if [ -z "$ENVSETUP_PATH" ]; then
-            echo "::error::Критическая ошибка: build/envsetup.sh не найден в исходниках Android!" && exit 1
-        fi
-        
-        # Переходим в корень исходников Android (на одну папку выше папки build)
-        cd "$(dirname "$ENVSETUP_PATH")/.."
-        
-        # Запуск окружения
+        # Запуск окружения Android из корня workspace
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
+        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Запуск lunch в трехкомпонентном формате Android 15
+        # Инициализация и старт компиляции в формате Android 15
         lunch ${{ env.DEVICE_MAKEFILE }}-trunk_staging-userdebug && make $MAKE_TARGET -j$(nproc --all)
 
 
