@@ -58,7 +58,9 @@ jobs:
 
     - name: Clone Device Tree & Check Makefile
       run: |
-        cd workspace
+        # Автоматически находим, где именно у нас создалась папка workspace
+        WORKSPACE_ROOT=$(find $GITHUB_WORKSPACE -type d -name "workspace" | head -n 1)
+        cd "$WORKSPACE_ROOT"
         
         # Ваш проверенный и быстрый блок клонирования дерева устройств
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
@@ -71,10 +73,10 @@ jobs:
             rm -rf open_tree
         fi
         
-        # КРИТИЧЕСКИЙ ФИКС: удаляем vendorsetup.sh, чтобы lunch не падал на Android 14/15
+        # Удаляем старый vendorsetup.sh
         rm -f "${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh"
 
-        # Фиксация мейкфайла под оригинальные исходники SebaUbuntu
+        # Фиксация мейкфайла
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
         elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
@@ -83,19 +85,28 @@ jobs:
             echo "::error::Критическая ошибка: Файл конфигурации .mk не найден!" && exit 1
         fi
 
-        
     - name: Building Image 
       run: |
-        cd workspace
+        # Умный поиск пути к envsetup.sh по всему репозиторию Actions
+        ENVSETUP_PATH=$(find $GITHUB_WORKSPACE -type f -name "envsetup.sh" | head -n 1)
+        
+        if [ -z "$ENVSETUP_PATH" ]; then
+            echo "::error::Критическая ошибка: build/envsetup.sh не найден в исходниках Android!" && exit 1
+        fi
+        
+        # Переходим в корень исходников Android (на одну папку выше папки build)
+        cd "$(dirname "$ENVSETUP_PATH")/.."
+        
+        # Запуск окружения
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
-        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Фикс для Android 14/15: используем новый формат <product>-trunk_staging-<variant>
+        # Запуск lunch в трехкомпонентном формате Android 15
         lunch ${{ env.DEVICE_MAKEFILE }}-trunk_staging-userdebug && make $MAKE_TARGET -j$(nproc --all)
+
 
 
     - name: Verify & Upload Release
