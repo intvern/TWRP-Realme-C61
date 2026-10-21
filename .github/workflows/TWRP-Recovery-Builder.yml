@@ -41,7 +41,7 @@ jobs:
 
     - name: Prepare Environment
       run: |
-        sudo apt update && sudo apt -y upgrade
+        sudo apt update
         sudo apt -y install gperf gcc-multilib g++-multilib libxml2-utils xsltproc bc ccache liblz4-tool libncurses5-dev lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp qemu-user-static libgflags-dev python3
         mkdir ~/bin && curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo && chmod a+x ~/bin/repo && sudo ln -sf ~/bin/repo /usr/bin/repo
 
@@ -49,17 +49,18 @@ jobs:
       run: |
         mkdir workspace && cd workspace
         git config --global user.name "intvern" && git config --global user.email "intvern@email.com"
-        repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
-        repo sync -j$(nproc --all) --force-sync
+        
+        # Оптимизированная инициализация: отключаем клонирование архивов bundle
+        repo init --depth=1 --no-clone-bundle -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+        
+        # Сверхскоростной синк: только текущая ветка, без тегов, оптимизированные сетевые потоки
+        repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle
 
     - name: Clone Device Tree & Check Makefile
       run: |
         cd workspace
-        
-        # Клонируем дерево устройств во временную папку
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         
-        # Переносим файлы и автоматически устраняем двойную вложенность папок
         if [ -d "open_tree/device" ]; then
             echo "Обнаружена вложенная структура папок. Переносим файлы..."
             cp -r open_tree/device/* device/ 2>/dev/null || true
@@ -71,20 +72,14 @@ jobs:
             rm -rf open_tree
         fi
         
-        # КРИТИЧЕСКИЙ ФИКС ДЛЯ ANDROID 14/15:
-        # Удаляем vendorsetup.sh, так как add_lunch_combo вызывает фатальный сбой парсинга в AOSP 14
         rm -f "${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh"
-        echo "Старый файл vendorsetup.sh успешно удален."
 
-        # Проверяем наличие оригинального мейкфайла от SebaUbuntu
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "Конфигурация omni_${{ github.event.inputs.DEVICE_NAME }} успешно подготовлена!"
         elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=twrp_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "Конфигурация twrp_${{ github.event.inputs.DEVICE_NAME }} успешно подготовлена!"
         else
-            echo "::error::Критическая ошибка: Файл конфигурации .mk не найден в папке устройства!" && exit 1
+            echo "::error::Критическая ошибка: Файл конфигурации .mk не найден!" && exit 1
         fi
 
     - name: Building Image 
@@ -93,12 +88,11 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
-        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Теперь lunch отработает идеально, так как профиль omni_ussi_arm64 прописан в COMMON_LUNCH_CHOICES
-        lunch ${{ env.DEVICE_MAKEFILE }}-userdebug && make clean && make $MAKE_TARGET -j$(nproc --all)
+        # Убрана команда 'make clean', сборка стартует мгновенно в чистой папке
+        lunch ${{ env.DEVICE_MAKEFILE }}-userdebug && make $MAKE_TARGET -j$(nproc --all)
 
     - name: Verify & Upload Release
       uses: softprops/action-gh-release@v1
