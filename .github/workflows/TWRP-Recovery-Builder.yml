@@ -50,30 +50,31 @@ jobs:
         mkdir workspace && cd workspace
         git config --global user.name "intvern" && git config --global user.email "intvern@email.com"
         
-        # Оптимизированная инициализация: отключаем клонирование архивов bundle
-        repo init --depth=1 --no-clone-bundle -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+        # Ускоренная инициализация манифеста с жесткой фильтрацией групп (минус системный софт и приложения)
+        repo init --depth=1 --no-clone-bundle --groups=default,-notdefault,-partner,-pdk,-app -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
         
-        # Сверхскоростной синк: только текущая ветка, без тегов, оптимизированные сетевые потоки
+        # Сверхскоростная синхронизация без лишней истории
         repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle
 
     - name: Clone Device Tree & Check Makefile
       run: |
         cd workspace
-        git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         
+        # Ваш проверенный и быстрый блок клонирования дерева устройств
+        git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         if [ -d "open_tree/device" ]; then
-            echo "Обнаружена вложенная структура папок. Переносим файлы..."
             cp -r open_tree/device/* device/ 2>/dev/null || true
             rm -rf open_tree
         else
-            echo "Обнаружена плоская структура. Переносим в целевой путь..."
             mkdir -p ${{ github.event.inputs.DEVICE_PATH }}
             mv open_tree/* ${{ github.event.inputs.DEVICE_PATH }}/ 2>/dev/null || true
             rm -rf open_tree
         fi
         
+        # КРИТИЧЕСКИЙ ФИКС: удаляем vendorsetup.sh, чтобы lunch не падал на Android 14/15
         rm -f "${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh"
 
+        # Фиксация мейкфайла под оригинальные исходники SebaUbuntu
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
         elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
@@ -91,7 +92,7 @@ jobs:
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Убрана команда 'make clean', сборка стартует мгновенно в чистой папке
+        # Компиляция без предварительной очистки 'make clean'
         lunch ${{ env.DEVICE_MAKEFILE }}-userdebug && make $MAKE_TARGET -j$(nproc --all)
 
     - name: Verify & Upload Release
