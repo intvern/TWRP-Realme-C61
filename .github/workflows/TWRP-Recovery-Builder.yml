@@ -47,36 +47,39 @@ jobs:
 
     - name: Initialize & Sync Repo
       run: |
-        mkdir workspace && cd workspace
+        mkdir -p workspace && cd workspace
+        echo "=== Структура папок после создания workspace ==="
+        ls -la
+        
         git config --global user.name "intvern" && git config --global user.email "intvern@email.com"
         
-        # Ускоренная инициализация манифеста с жесткой фильтрацией групп (минус системный софт и приложения)
-        repo init --depth=1 --no-clone-bundle --groups=default,-notdefault,-partner,-pdk,-app -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
-        
-        # Сверхскоростная синхронизация без лишней истории
+        # Загрузка полноценного манифеста (включая build/) в неглубоком режиме
+        repo init --depth=1 --no-clone-bundle -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ github.event.inputs.MANIFEST_BRANCH }}
         repo sync -c -j$(nproc --all) --force-sync --no-tags --no-clone-bundle
 
     - name: Clone Device Tree & Check Makefile
       run: |
-        # Автоматически находим, где именно у нас создалась папка workspace
-        WORKSPACE_ROOT=$(find $GITHUB_WORKSPACE -type d -name "workspace" | head -n 1)
-        cd "$WORKSPACE_ROOT"
+        cd workspace
+        echo "=== Структура папок в workspace перед клонированием дерева ==="
+        ls -la
         
-        # Ваш проверенный и быстрый блок клонирования дерева устройств
         git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} open_tree
         if [ -d "open_tree/device" ]; then
+            echo "Обнаружена вложенная структура папок. Переносим файлы..."
             cp -r open_tree/device/* device/ 2>/dev/null || true
             rm -rf open_tree
         else
+            echo "Обнаружена плоская структура. Переносим в целевой путь..."
             mkdir -p ${{ github.event.inputs.DEVICE_PATH }}
             mv open_tree/* ${{ github.event.inputs.DEVICE_PATH }}/ 2>/dev/null || true
             rm -rf open_tree
         fi
         
-        # Удаляем старый vendorsetup.sh
+        echo "=== Проверка структуры целевой папки устройства ==="
+        ls -la ${{ github.event.inputs.DEVICE_PATH }}
+        
         rm -f "${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh"
 
-        # Фиксация мейкфайла
         if [ -f "${{ github.event.inputs.DEVICE_PATH }}/omni_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
             echo "DEVICE_MAKEFILE=omni_${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
         elif [ -f "${{ github.event.inputs.DEVICE_PATH }}/twrp_${{ github.event.inputs.DEVICE_NAME }}.mk" ]; then
@@ -87,22 +90,21 @@ jobs:
 
     - name: Building Image 
       run: |
-        # Жестко переходим в корневую папку workspace, где лежит папка device
         cd $GITHUB_WORKSPACE/workspace
-        echo "Текущая рабочая директория: $(pwd)"
+        echo "=== Структура папок в workspace перед запуском компиляции ==="
+        ls -la
         
-        # Запуск окружения Android из корня workspace
+        if [ ! -f "build/envsetup.sh" ]; then
+            echo "::error::Критическая ошибка: Файл build/envsetup.sh не найден!" && exit 1
+        fi
+        
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
-        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Инициализация и старт компиляции в формате Android 15
         lunch ${{ env.DEVICE_MAKEFILE }}-trunk_staging-userdebug && make $MAKE_TARGET -j$(nproc --all)
-
-
 
     - name: Verify & Upload Release
       uses: softprops/action-gh-release@v1
