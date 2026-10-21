@@ -83,17 +83,20 @@ jobs:
             echo "::error::Критическая ошибка: Файл конфигурации .mk не найден!" && exit 1
         fi
 
+        
     - name: Building Image 
       run: |
         cd workspace
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         
+        # Подготовка правильного имени таргета компиляции
         MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
         [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ] && MAKE_TARGET="vendorbootimage"
         
-        # Компиляция без предварительной очистки 'make clean'
-        lunch ${{ env.DEVICE_MAKEFILE }}-userdebug && make $MAKE_TARGET -j$(nproc --all)
+        # Фикс для Android 14/15: используем новый формат <product>-trunk_staging-<variant>
+        lunch ${{ env.DEVICE_MAKEFILE }}-trunk_staging-userdebug && make $MAKE_TARGET -j$(nproc --all)
+
 
     - name: Verify & Upload Release
       uses: softprops/action-gh-release@v1
