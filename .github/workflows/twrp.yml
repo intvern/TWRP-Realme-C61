@@ -41,7 +41,6 @@ jobs:
     permissions:
       contents: write
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
       DEVICE_TREE: ${{ github.event.inputs.DEVICE_TREE }}
       DEVICE_TREE_BRANCH: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}
@@ -250,6 +249,55 @@ jobs:
         echo "--- fstab / recovery.fstab ---" | tee -a "$L"
         find . -name '*fstab*' -exec sh -c 'echo "## $1"; cat "$1"' _ {} \; 2>&1 | tee -a "$L" || true
 
+    - name: Probe dependencies & patch known incompatibilities
+      run: |
+        set +e
+        cd "$GITHUB_WORKSPACE/workspace"
+        L="$LOG_DIR/06b_probe_patch.log"
+        GOPTS=(--exclude-dir=.repo --exclude-dir=out --exclude-dir=.git --exclude-dir=prebuilts --include=Android.mk --include=Android.bp --include='*.mk' --include='*.bp')
+
+        {
+          echo "=== Проекты repo: security / keystore / recovery ==="
+          repo list 2>/dev/null | grep -iE "system/security|keystore|bootable/recovery|libtar"
+          echo
+          echo "=== prebuilt в дереве устройства ==="
+          ls -la "$DEV_PATH/prebuilt"
+          echo
+          echo "=== Android.mk и twrp.flags дерева ==="
+          cat "$DEV_PATH/Android.mk" "$DEV_PATH/twrp.flags"
+          echo
+          echo "=== Все ссылки на android.security.apc ==="
+          grep -rnI "${GOPTS[@]}" "android.security.apc" . | head -60
+          echo
+          echo "=== Определение libtar ==="
+          grep -rnI "${GOPTS[@]}" -E 'LOCAL_MODULE[[:space:]]*:=[[:space:]]*libtar$|name:[[:space:]]*"libtar"' . | head
+        } 2>&1 | tee "$L"
+
+        REFS=$(grep -rlI "${GOPTS[@]}" "android.security.apc-ndk_platform" . 2>/dev/null)
+        DEF=$(grep -rlI --exclude-dir=.git --include=Android.bp 'name: "android.security.apc"' system 2>/dev/null | head -1)
+        echo "Файлы со ссылкой на -ndk_platform: ${REFS:-<нет>}" | tee -a "$L"
+        echo "Определение aidl android.security.apc: ${DEF:-<нет>}" | tee -a "$L"
+
+        if [ -n "$DEF" ] && [ -n "$REFS" ]; then
+          echo "[PATCH] aidl-библиотека есть, заменяю устаревшее имя -ndk_platform на -ndk" | tee -a "$L"
+          for f in $REFS; do
+            sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
+            echo "  patched: $f" | tee -a "$L"
+          done
+        else
+          echo "[PATCH] aidl-библиотеки нет в исходниках, создаю заглушку android.security.apc-ndk_platform" | tee -a "$L"
+          mkdir -p external/twrp-stubs/apc
+          cat > external/twrp-stubs/apc/Android.bp <<'EOF'
+        cc_library_shared {
+            name: "android.security.apc-ndk_platform",
+            srcs: ["stub.c"],
+        }
+        EOF
+          echo 'void twrp_apc_stub(void) {}' > external/twrp-stubs/apc/stub.c
+          ls -la external/twrp-stubs/apc | tee -a "$L"
+        fi
+        exit 0
+
     - name: Building Image
       run: |
         set +e   # ошибки обрабатываем вручную, чтобы всегда получить логи
@@ -326,6 +374,12 @@ jobs:
           tail -n 150 out/error.log 2>/dev/null || echo "out/error.log отсутствует"
           echo "=========== последние 80 строк build.log ==========="
           tail -n 80 "$LOG_DIR/08_build.log"
+          {
+            echo "=========== ДИАГНОСТИКА: apc / libtar в сгенерированном Soong-mk ==========="
+            grep -ho 'android\.security\.apc[A-Za-z0-9_.-]*' out/soong/Android-*.mk 2>/dev/null | sort | uniq -c
+            grep -n -A15 'LOCAL_MODULE := libtar$' out/soong/Android-*.mk 2>/dev/null | head -40
+            grep -rn "libtar" --include=Android.mk --include=Android.bp bootable external 2>/dev/null | head -20
+          } 2>&1 | tee "$LOG_DIR/10_diag.log"
           exit "$BUILD_RC"
         fi
         echo "[SUCCESS] Сборка завершена"
@@ -343,9 +397,13 @@ jobs:
         done
 
         # Логи сборки AOSP
-        for f in error.log soong.log verbose.log.gz build.trace.gz; do
+        for f in error.log verbose.log.gz build.trace.gz; do
           [ -f "workspace/out/$f" ] && cp "workspace/out/$f" "logs/aosp_$f"
         done
+        # soong.log содержит дамп окружения, включая токен: маскируем
+        if [ -f workspace/out/soong.log ]; then
+          sed -E 's/([A-Za-z_]*(TOKEN|SECRET|PASSWORD|KEY)[A-Za-z_]*=)[^ ]+/\1***/g' workspace/out/soong.log > logs/aosp_soong.log
+        fi
 
         {
           echo "### Результат сборки TWRP ($DEVICE_NAME, $BUILD_TARGET, $MANIFEST_BRANCH)"
