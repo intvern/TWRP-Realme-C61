@@ -1,0 +1,381 @@
+name: TWRP Recovery Builder 2024
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_BRANCH:
+        description: 'Ветка минимального манифеста TWRP'
+        required: true
+        default: 'twrp-14.1'
+        type: choice
+        options: ['twrp-14.1', 'twrp-12.1', 'twrp-11']
+      DEVICE_TREE:
+        description: 'URL дерева устройства'
+        required: true
+        default: 'https://github.com/intvern/REALME-C61-DEVICE-TREE-TWRP'
+      DEVICE_TREE_BRANCH:
+        description: 'Ветка дерева устройства'
+        required: true
+        default: 'main'
+      DEVICE_PATH:
+        description: 'Путь устройства внутри исходников'
+        required: true
+        default: 'device/realme/RMX3930'
+      DEVICE_NAME:
+        description: 'Кодовое имя устройства'
+        required: true
+        default: 'RMX3930'
+      BUILD_TARGET:
+        description: 'Что собираем'
+        required: true
+        default: 'vendorboot'
+        type: choice
+        options: ['boot', 'recovery', 'vendorboot']
+
+jobs:
+  build:
+    name: Build TWRP
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    if: github.event.repository.owner.id == github.event.sender.id
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
+      DEVICE_TREE: ${{ github.event.inputs.DEVICE_TREE }}
+      DEVICE_TREE_BRANCH: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}
+      DEVICE_PATH: ${{ github.event.inputs.DEVICE_PATH }}
+      DEVICE_NAME: ${{ github.event.inputs.DEVICE_NAME }}
+      BUILD_TARGET: ${{ github.event.inputs.BUILD_TARGET }}
+      LOG_DIR: ${{ github.workspace }}/logs
+      LC_ALL: C
+    steps:
+    - name: Check Out
+      uses: actions/checkout@v4
+
+    - name: Init logs & print inputs
+      run: |
+        mkdir -p "$LOG_DIR" "$GITHUB_WORKSPACE/output"
+        {
+          echo "=== ВХОДНЫЕ ПАРАМЕТРЫ ==="
+          echo "MANIFEST_BRANCH    = $MANIFEST_BRANCH"
+          echo "DEVICE_TREE        = $DEVICE_TREE"
+          echo "DEVICE_TREE_BRANCH = $DEVICE_TREE_BRANCH"
+          echo "DEVICE_PATH        = $DEVICE_PATH"
+          echo "DEVICE_NAME        = $DEVICE_NAME"
+          echo "BUILD_TARGET       = $BUILD_TARGET"
+        } | tee "$LOG_DIR/00_inputs.log"
+
+    - name: Check Hardware & Environment Specs
+      run: |
+        {
+          echo "=== ИНФОРМАЦИЯ О СИСТЕМЕ ==="
+          lscpu | grep "Model name"
+          echo "Ядер: $(nproc --all)"
+          free -h
+          df -h
+          cat /etc/os-release | head -3
+        } 2>&1 | tee "$LOG_DIR/01_system.log"
+
+    - name: Free disk space & add swap
+      run: |
+        echo "=== ДО ОЧИСТКИ ===" && df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+                    /usr/local/share/powershell /usr/local/share/chromium || true
+        sudo docker image prune -af >/dev/null 2>&1 || true
+        sudo apt-get clean || true
+        echo "=== ПОСЛЕ ОЧИСТКИ ===" && df -h /
+
+        echo "=== SWAP ==="
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile /swapfile
+        MNT_FREE=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')
+        MNT_SWAP=$(( MNT_FREE - 2 )); [ "$MNT_SWAP" -gt 12 ] && MNT_SWAP=12
+        echo "Свободно на /mnt: ${MNT_FREE}G -> swap ${MNT_SWAP}G"
+        sudo fallocate -l "${MNT_SWAP}G" /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        sudo fallocate -l 6G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        free -h; df -h / /mnt
+
+    - name: Prepare Environment
+      run: |
+        set -eo pipefail
+        echo "=== УСТАНОВКА ПАКЕТОВ ==="
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
+          git curl rsync zip unzip bc bison flex gperf build-essential \
+          gcc-multilib g++-multilib libxml2-utils xsltproc ccache lz4 liblz4-tool \
+          libncurses5-dev lzop pngcrush schedtool squashfs-tools imagemagick \
+          libbz2-dev lzma libgflags-dev libssl-dev libelf-dev zlib1g-dev \
+          python3 python-is-python3 2>&1 | tee "$LOG_DIR/02_apt.log"
+
+        echo "=== УСТАНОВКА REPO ==="
+        sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+        sudo chmod a+x /usr/local/bin/repo
+        repo --version 2>&1 | tee -a "$LOG_DIR/02_apt.log"
+
+    - name: Initialize & Sync Repo
+      run: |
+        set -eo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/workspace" && cd "$GITHUB_WORKSPACE/workspace"
+
+        git config --global user.name "intvern"
+        git config --global user.email "intvern@email.com"
+        git config --global color.ui true
+
+        echo "=== ИНИЦИАЛИЗАЦИЯ МАНИФЕСТА TWRP ($MANIFEST_BRANCH) ==="
+        repo init --depth=1 --no-clone-bundle --no-repo-verify \
+          -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+          -b "$MANIFEST_BRANCH" 2>&1 | tee "$LOG_DIR/03_repo_init.log"
+
+        echo "=== СИНХРОНИЗАЦИЯ ИСХОДНИКОВ (до 3 попыток) ==="
+        JOBS=$(( $(nproc --all) * 2 ))
+        OK=0
+        for attempt in 1 2 3; do
+          echo "--- Попытка $attempt (jobs=$JOBS) ---"
+          if repo sync -c -j"$JOBS" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune \
+               2>&1 | tee -a "$LOG_DIR/04_repo_sync.log"; then
+            OK=1; break
+          fi
+          echo "[WARN] sync не удался, повтор с -j2"
+          JOBS=2
+          sleep 10
+        done
+        if [ "$OK" != "1" ]; then
+          echo "::error::[КРИТИЧЕСКАЯ ОШИБКА] repo sync не удался за 3 попытки. Смотри logs/04_repo_sync.log"
+          exit 1
+        fi
+
+        echo "=== РАЗМЕР ИСХОДНИКОВ ===" && du -sh . && df -h /
+        [ -f build/envsetup.sh ] || { echo "::error::build/envsetup.sh не найден после sync"; exit 1; }
+
+    - name: Clone Device Tree
+      run: |
+        set -eo pipefail
+        cd "$GITHUB_WORKSPACE/workspace"
+        L="$LOG_DIR/05_device_tree.log"
+
+        echo "=== КЛОНИРОВАНИЕ ДЕРЕВА УСТРОЙСТВА ===" | tee "$L"
+        git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE" open_tree 2>&1 | tee -a "$L"
+        echo "Коммит дерева: $(git -C open_tree rev-parse HEAD)" | tee -a "$L"
+
+        echo "=== СТРУКТУРА КЛОНА (2 уровня) ===" | tee -a "$L"
+        (cd open_tree && find . -path ./.git -prune -o -maxdepth 4 -print | head -80) | tee -a "$L"
+
+        echo "=== РАЗМЕЩЕНИЕ ДЕРЕВА ===" | tee -a "$L"
+        if [ -d open_tree/device ]; then
+          echo "[INFO] Вложенная структура (есть device/). Мержим в корень исходников." | tee -a "$L"
+          rsync -a --exclude='.git' --exclude='.github' --exclude='.gitignore' \
+                --exclude='README*' --exclude='LICENSE*' open_tree/ ./
+        else
+          echo "[INFO] Плоская структура. Копируем в $DEVICE_PATH" | tee -a "$L"
+          mkdir -p "$DEVICE_PATH"
+          rsync -a --exclude='.git' --exclude='.github' open_tree/ "$DEVICE_PATH/"
+        fi
+        rm -rf open_tree
+
+        # Если DEVICE_PATH не совпал — ищем реальный путь по AndroidProducts.mk
+        DEV_PATH="$DEVICE_PATH"
+        if [ ! -f "$DEV_PATH/AndroidProducts.mk" ]; then
+          echo "[WARN] $DEV_PATH/AndroidProducts.mk не найден, ищу реальный путь..." | tee -a "$L"
+          FOUND=$(find device -name AndroidProducts.mk -path "*${DEVICE_NAME}*" 2>/dev/null | head -1 || true)
+          [ -z "$FOUND" ] && FOUND=$(find device -name AndroidProducts.mk -newer build/envsetup.sh 2>/dev/null | head -1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "::error::[КРИТИЧЕСКАЯ ОШИБКА] AndroidProducts.mk не найден. Проверь структуру дерева (см. logs/05_device_tree.log)"
+            ls -la device/ device/*/ 2>&1 | tee -a "$L" || true
+            exit 1
+          fi
+          DEV_PATH=$(dirname "$FOUND")
+          echo "[INFO] Реальный путь устройства: $DEV_PATH" | tee -a "$L"
+        fi
+        echo "DEV_PATH=$DEV_PATH" >> "$GITHUB_ENV"
+
+        echo "=== СОДЕРЖИМОЕ $DEV_PATH ===" | tee -a "$L"
+        ls -la "$DEV_PATH" | tee -a "$L"
+
+        if [ -f "$DEV_PATH/vendorsetup.sh" ]; then
+          echo "[INFO] Удаляем vendorsetup.sh (избегаем конфликтов lunch)" | tee -a "$L"
+          rm -f "$DEV_PATH/vendorsetup.sh"
+        fi
+
+    - name: Detect product makefile & sanity-check tree
+      run: |
+        set -eo pipefail
+        cd "$GITHUB_WORKSPACE/workspace/$DEV_PATH"
+        L="$LOG_DIR/06_makefile_check.log"
+        echo "=== ПОИСК КОНФИГУРАЦИОННОГО МЕЙКФАЙЛА ===" | tee "$L"
+
+        MK=""
+        if [ -f "twrp_${DEVICE_NAME}.mk" ]; then
+          MK="twrp_${DEVICE_NAME}.mk"
+        elif [ -f "omni_${DEVICE_NAME}.mk" ]; then
+          echo "[WARN] Найден omni_${DEVICE_NAME}.mk. Конвертирую в twrp_ (omni -> twrp)" | tee -a "$L"
+          sed -e 's#omni_#twrp_#g' -e 's#vendor/omni/#vendor/twrp/#g' "omni_${DEVICE_NAME}.mk" > "twrp_${DEVICE_NAME}.mk"
+          rm -f "omni_${DEVICE_NAME}.mk"
+          [ -f AndroidProducts.mk ] && sed -i 's#omni_#twrp_#g' AndroidProducts.mk
+          MK="twrp_${DEVICE_NAME}.mk"
+        else
+          CAND=$(ls *_${DEVICE_NAME}.mk 2>/dev/null | head -1 || true)
+          if [ -n "$CAND" ]; then
+            echo "[WARN] Нестандартный префикс: $CAND" | tee -a "$L"
+            MK="$CAND"
+          else
+            echo "::error::[КРИТИЧЕСКАЯ ОШИБКА] Не найден *_${DEVICE_NAME}.mk в $DEV_PATH"
+            ls -la | tee -a "$L"
+            exit 1
+          fi
+        fi
+
+        PRODUCT=$(sed -nE 's/^[[:space:]]*PRODUCT_NAME[[:space:]]*:?=[[:space:]]*([^[:space:]#]+).*/\1/p' "$MK" | head -1 || true)
+        [ -z "$PRODUCT" ] && PRODUCT="${MK%.mk}"
+        echo "[SUCCESS] Мейкфайл: $MK ; PRODUCT_NAME: $PRODUCT" | tee -a "$L"
+        echo "LUNCH_PRODUCT=$PRODUCT" >> "$GITHUB_ENV"
+
+        for f in "$MK" AndroidProducts.mk BoardConfig.mk; do
+          echo "################ $f ################" | tee -a "$L"
+          [ -f "$f" ] && cat "$f" | tee -a "$L" || echo "[WARN] $f отсутствует" | tee -a "$L"
+        done
+
+        echo "=== ПРОВЕРКА ЯДРА / DTB / БОЛЬШИХ ФАЙЛОВ ===" | tee -a "$L"
+        grep -nE "PREBUILT_KERNEL|PREBUILT_DTB|PREBUILT_DTBO|BOARD_KERNEL_IMAGE_NAME|TARGET_NO_KERNEL|BOARD_BOOT_HEADER_VERSION|BOARD_INCLUDE_RECOVERY_DTBO|BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT" BoardConfig.mk 2>&1 | tee -a "$L" || true
+        echo "--- файлы > 500 КБ в дереве ---" | tee -a "$L"
+        find . -type f -size +500k -exec ls -lh {} \; 2>&1 | tee -a "$L" || true
+        echo "--- fstab / recovery.fstab ---" | tee -a "$L"
+        find . -name '*fstab*' -exec sh -c 'echo "## $1"; cat "$1"' _ {} \; 2>&1 | tee -a "$L" || true
+
+    - name: Building Image
+      run: |
+        set +e   # ошибки обрабатываем вручную, чтобы всегда получить логи
+        cd "$GITHUB_WORKSPACE/workspace"
+        L="$LOG_DIR/07_lunch.log"
+
+        echo "=== ПОДКЛЮЧЕНИЕ СРЕДЫ СБОРКИ ===" | tee "$L"
+        source build/envsetup.sh >> "$L" 2>&1
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export LC_ALL=C
+
+        case "$BUILD_TARGET" in
+          boot)       MAKE_TARGET="bootimage" ;;
+          recovery)   MAKE_TARGET="recoveryimage" ;;
+          vendorboot) MAKE_TARGET="vendorbootimage" ;;
+          *) echo "::error::Неизвестный BUILD_TARGET=$BUILD_TARGET"; exit 1 ;;
+        esac
+
+        echo "=== ПОДБОР LUNCH-КОМБО для $LUNCH_PRODUCT ===" | tee -a "$L"
+        LUNCH_OK=""
+        for variant in eng ap2a-eng ap1a-eng ap3a-eng ap4a-eng bp1a-eng userdebug ap2a-userdebug; do
+          COMBO="${LUNCH_PRODUCT}-${variant}"
+          echo "::group::lunch $COMBO"
+          lunch "$COMBO" > /tmp/lunch.out 2>&1
+          RC=$?
+          tee -a "$L" < /tmp/lunch.out
+          echo "::endgroup::"
+          if [ $RC -eq 0 ] && [ -n "$TARGET_PRODUCT" ]; then
+            LUNCH_OK="$COMBO"
+            echo "[SUCCESS] lunch сработал: $COMBO" | tee -a "$L"
+            break
+          else
+            echo "[INFO] $COMBO не подошёл (rc=$RC)" | tee -a "$L"
+          fi
+        done
+
+        if [ -z "$LUNCH_OK" ]; then
+          echo "::error::[КРИТИЧЕСКАЯ ОШИБКА] Ни одно lunch-комбо не сработало. Смотри logs/07_lunch.log"
+          echo "--- AndroidProducts.mk ---"; cat "$DEV_PATH/AndroidProducts.mk"
+          exit 1
+        fi
+
+        echo "=== ПЕРЕМЕННЫЕ СБОРКИ ===" | tee -a "$L"
+        {
+          echo "TARGET_PRODUCT  = $TARGET_PRODUCT"
+          echo "TARGET_DEVICE   = $(get_build_var TARGET_DEVICE)"
+          echo "PLATFORM        = $(get_build_var TARGET_BOARD_PLATFORM)"
+          echo "ARCH            = $(get_build_var TARGET_ARCH)"
+          echo "PLATFORM_VERSION= $(get_build_var PLATFORM_VERSION)"
+          echo "BUILD_TARGET    = $MAKE_TARGET"
+        } 2>&1 | tee -a "$L"
+
+        # Ограничиваем память Go-части Soong (soft limit) и пишем мониторинг ресурсов
+        export GOGC=50
+        export GOMEMLIMIT=4GiB
+        (
+          while true; do
+            echo "[MON $(date +%T)] $(free -m | awk '/Mem:/{print "RAM used/total MB: "$3"/"$2}') | $(free -m | awk '/Swap:/{print "swap used MB: "$3}') | $(df -h / | awk 'NR==2{print "disk / free: "$4}') | $(df -h /mnt | awk 'NR==2{print "/mnt free: "$4}')" | tee -a "$LOG_DIR/09_monitor.log"
+            sleep 20
+          done
+        ) &
+        MON_PID=$!
+
+        echo "=== СТАРТ КОМПИЛЯЦИИ: make $MAKE_TARGET ===" | tee "$LOG_DIR/08_build.log"
+        nice -n 19 ionice -c3 make "$MAKE_TARGET" -j"$(nproc --all)" 2>&1 | tee -a "$LOG_DIR/08_build.log"
+        BUILD_RC=${PIPESTATUS[0]}
+        kill $MON_PID 2>/dev/null
+        echo "make rc=$BUILD_RC"
+        dmesg 2>/dev/null | grep -iE "killed process|out of memory" | tail -5
+
+        if [ "$BUILD_RC" -ne 0 ]; then
+          echo "::error::[ОШИБКА СБОРКИ] make завершился с кодом $BUILD_RC"
+          echo "=========== out/error.log (хвост) ==========="
+          tail -n 150 out/error.log 2>/dev/null || echo "out/error.log отсутствует"
+          echo "=========== последние 80 строк build.log ==========="
+          tail -n 80 "$LOG_DIR/08_build.log"
+          exit "$BUILD_RC"
+        fi
+        echo "[SUCCESS] Сборка завершена"
+
+    - name: Collect output & logs
+      if: always()
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        P=workspace/out/target/product
+        echo "=== ВСЕ .img В ВЫВОДЕ ==="
+        find "$P" -maxdepth 2 -name '*.img' -exec ls -lh {} \; 2>/dev/null || echo "[WARN] .img файлов нет"
+
+        for n in recovery.img boot.img vendor_boot.img; do
+          find "$P" -maxdepth 2 -name "$n" -exec cp -v {} output/ \; 2>/dev/null
+        done
+
+        # Логи сборки AOSP
+        for f in error.log soong.log verbose.log.gz build.trace.gz; do
+          [ -f "workspace/out/$f" ] && cp "workspace/out/$f" "logs/aosp_$f"
+        done
+
+        {
+          echo "### Результат сборки TWRP ($DEVICE_NAME, $BUILD_TARGET, $MANIFEST_BRANCH)"
+          echo "Собранные образы:"
+          ls -lh output/ 2>/dev/null || echo "нет"
+          echo ""
+          echo "Логи: артефакт **build-logs** внизу страницы запуска."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: logs/
+        if-no-files-found: warn
+
+    - name: Upload images (artifact)
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: twrp-images
+        path: output/*.img
+        if-no-files-found: error
+
+    - name: Upload Release Artifacts
+      if: success() && hashFiles('output/*.img') != ''
+      uses: softprops/action-gh-release@v2
+      with:
+        files: output/*.img
+        name: Unofficial TWRP for Realme C61 (${{ github.event.inputs.DEVICE_NAME }})
+        tag_name: twrp-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        fail_on_unmatched_files: false
