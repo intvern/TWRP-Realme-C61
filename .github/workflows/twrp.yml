@@ -314,7 +314,7 @@ jobs:
         MON_PID=$!
 
         echo "=== СТАРТ КОМПИЛЯЦИИ: make $MAKE_TARGET ===" | tee "$LOG_DIR/08_build.log"
-        nice -n 19 ionice -c3 make "$MAKE_TARGET" -j"$(nproc --all)" 2>&1 | tee -a "$LOG_DIR/08_build.log"
+        nice -n 19 ionice -c3 build/soong/soong_ui.bash --make-mode -j"$(nproc --all)" "$MAKE_TARGET" 2>&1 | tee -a "$LOG_DIR/08_build.log"
         BUILD_RC=${PIPESTATUS[0]}
         kill $MON_PID 2>/dev/null
         echo "make rc=$BUILD_RC"
